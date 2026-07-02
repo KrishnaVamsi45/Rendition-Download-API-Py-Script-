@@ -1,0 +1,330 @@
+import csv
+import getpass
+import os
+import re
+import sys
+from pathlib import Path
+
+import requests
+
+
+def load_env_file(env_path: Path | None = None) -> None:
+    """Load key/value pairs from a .env file into os.environ if not already set."""
+    path = env_path or Path(__file__).resolve().parent / ".env"
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        if line.startswith("export "):
+            line = line[len("export "):].strip()
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+def authenticate(vault_dns: str, username: str, password: str, api_version: str) -> str:
+    """Authenticate with username/password and return a Vault sessionId."""
+    url = f"https://{vault_dns}/api/{api_version}/auth"
+    resp = requests.post(
+        url,
+        data={"username": username, "password": password},
+        headers={"Accept": "application/json"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+
+    if data.get("responseStatus") != "SUCCESS":
+        raise RuntimeError(f"Authentication failed: {data}")
+
+    session_id = data.get("sessionId")
+    if not session_id:
+        raise RuntimeError(f"No sessionId returned: {data}")
+
+    print(f"Authenticated to {vault_dns} as {username}")
+    return session_id
+
+
+def sanitize_filename(name: str) -> str:
+    """Strip characters that aren't safe in file/folder names across OSes."""
+    name = name.strip()
+    name = re.sub(r'[\\/:*?"<>|]', "_", name)
+    name = re.sub(r"\s+", " ", name)
+    return name or "untitled"
+
+
+def read_doc_rows(csv_path: str, id_column: str, name_column: str, major_version_column: str) -> list:
+    """
+    Read (id, name, major_version) triples from the CSV, deduplicated by
+    (id, major_version). Keeps the name from the first row encountered for
+    each unique combination.
+    """
+    seen = {}
+    order = []
+    with open(csv_path, newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        required = (id_column, name_column, major_version_column)
+        missing = [c for c in required if c not in reader.fieldnames]
+        if missing:
+            raise ValueError(
+                f"Column(s) {missing} not found in CSV. "
+                f"Available columns: {reader.fieldnames}"
+            )
+        for row in reader:
+            doc_id = (row.get(id_column) or "").strip()
+            name = (row.get(name_column) or "").strip()
+            major = (row.get(major_version_column) or "").strip()
+            if not doc_id or not major:
+                continue
+            key = (doc_id, major)
+            if key not in seen:
+                seen[key] = name
+                order.append(key)
+
+    return [{"id": doc_id, "major": major, "name": seen[(doc_id, major)]} for (doc_id, major) in order]
+
+
+def download_version_rendition(
+    session: requests.Session,
+    vault_dns: str,
+    api_version: str,
+    doc_id: str,
+    major: str,
+    minor: str,
+    doc_name: str,
+    rendition_type: str,
+    output_dir: Path,
+    protected_rendition: bool = None,
+) -> dict:
+    """
+    Download a specific major.minor version's rendition for a document and
+    save it to:
+        {output_dir}/{doc_id}/{sanitized_name}_v{major}.{ext}
+    Returns a dict describing the outcome (for logging).
+    """
+    url = (
+        f"https://{vault_dns}/api/{api_version}/objects/documents/{doc_id}"
+        f"/versions/{major}/{minor}/renditions/{rendition_type}"
+    )
+
+    params = {}
+    if protected_rendition is not None:
+        params["protectedRendition"] = "true" if protected_rendition else "false"
+
+    resp = session.get(url, params=params, stream=True, timeout=60)
+
+    content_type = resp.headers.get("Content-Type", "")
+
+    # Vault returns application/json on errors (e.g. doc/version/rendition not
+    # found, no permission, etc). A successful file download is octet-stream.
+    if "application/json" in content_type:
+        try:
+            err_json = resp.json()
+        except ValueError:
+            err_json = {"raw": resp.text[:500]}
+        return {
+            "doc_id": doc_id,
+            "version": f"{major}.{minor}",
+            "status": "FAILED",
+            "detail": str(err_json),
+            "file_path": "",
+        }
+
+    if resp.status_code != 200:
+        return {
+            "doc_id": doc_id,
+            "version": f"{major}.{minor}",
+            "status": "FAILED",
+            "detail": f"HTTP {resp.status_code}",
+            "file_path": "",
+        }
+
+    # Try to pull a file extension from Content-Disposition; default to .pdf
+    # (viewable_rendition__v is virtually always a PDF, but this stays generic).
+    ext = "pdf"
+    cd = resp.headers.get("Content-Disposition", "")
+    if "filename=" in cd:
+        cd_filename = cd.split("filename=")[-1].strip().strip('"')
+        if "." in cd_filename:
+            ext = cd_filename.rsplit(".", 1)[-1]
+
+    doc_folder = output_dir / sanitize_filename(doc_id)
+    doc_folder.mkdir(parents=True, exist_ok=True)
+
+    base_name = sanitize_filename(doc_name) if doc_name else doc_id
+    out_path = doc_folder / f"{base_name}_v{major}.{ext}"
+
+    with open(out_path, "wb") as f:
+        for chunk in resp.iter_content(chunk_size=1024 * 256):
+            if chunk:
+                f.write(chunk)
+
+    return {
+        "doc_id": doc_id,
+        "version": f"{major}.{minor}",
+        "status": "SUCCESS",
+        "detail": "",
+        "file_path": str(out_path),
+    }
+
+
+def main():
+    load_env_file()
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--vault-dns",
+        default=os.environ.get("VAULT_DNS"),
+        help="e.g. myvault.veevavault.com (or set VAULT_DNS in .env)",
+    )
+    parser.add_argument(
+        "--username",
+        default=os.environ.get("VAULT_USERNAME"),
+        help="Vault username (or set VAULT_USERNAME in .env)",
+    )
+    parser.add_argument(
+        "--api-version",
+        default=os.environ.get("VAULT_API_VERSION", "v26.1"),
+        help="API version, default v26.1",
+    )
+    parser.add_argument(
+        "--csv",
+        default=os.environ.get("CSV_PATH"),
+        help="Path to CSV file with document IDs (or set CSV_PATH in .env)",
+    )
+    parser.add_argument(
+        "--id-column", default="id", help="Column containing the document id (default: id)"
+    )
+    parser.add_argument(
+        "--name-column",
+        default="name__v",
+        help="Column to use as the output filename (default: name__v)",
+    )
+    parser.add_argument(
+        "--major-version-column",
+        default="major_version_number__v",
+        help="Column containing the major version number (default: major_version_number__v)",
+    )
+    parser.add_argument(
+        "--minor-version",
+        default="0",
+        help="Minor version to use for every major version (default: 0, the steady-state version)",
+    )
+    parser.add_argument(
+        "--rendition-type",
+        default=os.environ.get("RENDITION_TYPE"),
+        help="Rendition type to download for every document, e.g. viewable_rendition__v",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=os.environ.get("OUTPUT_DIR", "./renditions"),
+        help="Folder to save downloaded files into",
+    )
+    parser.add_argument(
+        "--non-protected",
+        action="store_true",
+        help="Request the non-protected rendition (requires permission)",
+    )
+    args = parser.parse_args()
+
+    missing = [
+        name
+        for name, value in {
+            "--vault-dns": args.vault_dns,
+            "--username": args.username,
+            "--csv": args.csv,
+            "--rendition-type": args.rendition_type,
+        }.items()
+        if not value
+    ]
+    if missing:
+        parser.error(
+            "the following arguments are required: " + ", ".join(missing)
+            + " (or set the matching values in .env / environment)"
+        )
+
+    password = os.environ.get("VAULT_PASSWORD") or getpass.getpass(
+        f"Password for {args.username}: "
+    )
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        session_id = authenticate(args.vault_dns, args.username, password, args.api_version)
+    except Exception as e:
+        print(f"ERROR: Could not authenticate: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    session = requests.Session()
+    session.headers.update({"Authorization": session_id, "Accept": "application/json"})
+
+    try:
+        doc_rows = read_doc_rows(
+            args.csv, args.id_column, args.name_column, args.major_version_column
+        )
+    except Exception as e:
+        print(f"ERROR: Could not read CSV: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Found {len(doc_rows)} unique (doc id, major version) combinations in {args.csv}")
+
+    results = []
+    for i, row in enumerate(doc_rows, start=1):
+        doc_id = row["id"]
+        major = row["major"]
+        doc_name = row["name"]
+        print(
+            f"[{i}/{len(doc_rows)}] Downloading {args.rendition_type} for doc {doc_id} "
+            f"v{major}.{args.minor_version} ({doc_name}) ...",
+            end=" ",
+        )
+        try:
+            result = download_version_rendition(
+                session=session,
+                vault_dns=args.vault_dns,
+                api_version=args.api_version,
+                doc_id=doc_id,
+                major=major,
+                minor=args.minor_version,
+                doc_name=doc_name,
+                rendition_type=args.rendition_type,
+                output_dir=output_dir,
+                protected_rendition=(False if args.non_protected else None),
+            )
+        except Exception as e:
+            result = {
+                "doc_id": doc_id,
+                "version": f"{major}.{args.minor_version}",
+                "status": "FAILED",
+                "detail": str(e),
+                "file_path": "",
+            }
+
+        print(result["status"])
+        results.append(result)
+
+    # Write a summary log
+    log_path = output_dir / "results_log.csv"
+    with open(log_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["doc_id", "version", "status", "detail", "file_path"])
+        writer.writeheader()
+        writer.writerows(results)
+
+    success_count = sum(1 for r in results if r["status"] == "SUCCESS")
+    fail_count = len(results) - success_count
+    print(f"\nDone. {success_count} succeeded, {fail_count} failed.")
+    print(f"Files saved to: {output_dir.resolve()}")
+    print(f"Log saved to:   {log_path.resolve()}")
+
+
+if __name__ == "__main__":
+    main()

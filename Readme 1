@@ -1,0 +1,399 @@
+1. What this Script Does
+This script:
+✅ Reads document IDs from a CSV file
+✅ Authenticates to Veeva Vault
+✅ Gets a Session ID
+✅ Downloads a specific rendition of each document
+✅ Saves files locally
+✅ Creates a success/failure log
+In simple language:
+Plain TextCSV File   ↓Login to Vault   ↓Read Document IDs   ↓Download PDF/Viewable Rendition   ↓Save Files   ↓Create Log ReportShow more lines
+
+2. Imports Explained
+argparse
+Pythonimport argparseShow more lines
+Used to accept command-line arguments.
+Example:
+Shellpython script.py --vault-dns abc.veevavault.comShow more lines
+Here:
+Pythonargs.vault_dnsShow more lines
+gets the value.
+
+csv
+Pythonimport csvShow more lines
+Used for reading and writing CSV files.
+Example:
+Pythonid,name123,Doc1124,Doc2Show more lines
+Python reads this as rows.
+
+getpass
+Pythonimport getpassShow more lines
+Used for securely entering passwords.
+Example:
+Pythonpassword = getpass.getpass()Show more lines
+Typing is hidden:
+Plain TextPassword:********Show more lines
+
+os
+Pythonimport osShow more lines
+Used for:
+
+Environment variables
+File paths
+Operating system interaction
+
+Example:
+Pythonos.environ["VAULT_DNS"]Show more lines
+Read environment variable.
+
+re
+Pythonimport reShow more lines
+Regular Expressions.
+Used for text replacement.
+Example:
+Pythonre.sub("[0-9]", "", "abc123")Show more lines
+Output:
+Plain TextabcShow more lines
+
+sys
+Pythonimport sysShow more lines
+Used for script exit.
+Example:
+Pythonsys.exit(1)Show more lines
+Stop execution.
+
+Path
+Pythonfrom pathlib import PathShow more lines
+Modern file/folder handling.
+Example:
+PythonPath("downloads")Show more lines
+Creates path object.
+Better than string paths.
+
+requests
+Pythonimport requestsShow more lines
+Most important library for API automation.
+Used to:
+PythonGETPOSTPUTDELETEShow more lines
+requests to Vault.
+Example:
+Pythonrequests.get(url)Show more lines
+
+3. Function: load_env_file()
+Pythondef load_env_file(...):Show more lines
+Purpose:
+Read values from .env.
+Example:
+Plain Textenv isn’t fully supported. Syntax highlighting is based on Plain Text.VAULT_DNS=myvault.veevavault.comVAULT_USERNAME=user@test.comShow more lines
+
+Read file
+Pythonpath.read_text()Show more lines
+Reads entire .env file.
+
+Split into lines
+Python.splitlines()Show more lines
+Converts:
+Plain TextA=1B=2Show more lines
+into:
+Python["A=1", "B=2"]Show more lines
+
+Ignore comments
+Pythonif line.startswith("#")Show more lines
+Ignores
+Plain Textenv isn’t fully supported. Syntax highlighting is based on Plain Text.# This is commentShow more lines
+
+Split Key and Value
+Pythonkey, value = line.split("=",1)Show more lines
+Example:
+Plain TextVAULT_DNS=myvaultShow more lines
+becomes
+Pythonkey="VAULT_DNS"value="myvault"Show more lines
+
+Store in environment
+Pythonos.environ[key] = valueShow more lines
+Now available throughout script.
+
+4. authenticate()
+Pythondef authenticate(...)Show more lines
+Purpose:
+Login to Veeva Vault.
+
+Build URL
+Pythonurl = f"https://{vault_dns}/api/{api_version}/auth"Show more lines
+Suppose:
+Pythonvault_dns="company.veevavault.com"api_version="v26.1"Show more lines
+Result:
+Plain Texthttps://company.veevavault.com/api/v26.1/authShow more lines
+
+Send POST
+Pythonrequests.post()Show more lines
+POST means:
+Plain TextSend data to serverShow more lines
+Body:
+Python{ "username": username, "password": password}Show more lines
+
+Check status
+Pythonresp.raise_for_status()Show more lines
+If:
+Plain Text404500401Show more lines
+error occurs.
+
+Convert JSON
+Pythondata = resp.json()Show more lines
+Vault returns:
+JSON{  "responseStatus":"SUCCESS",  "sessionId":"abc123"}Show more lines
+Converted to Python dictionary.
+
+Get Session ID
+Pythonsession_id = data.get("sessionId")Show more lines
+Example:
+Python"abc123"Show more lines
+Used for every future request.
+Think of it as:
+Plain TextTemporary login tokenShow more lines
+
+5. sanitize_filename()
+Purpose:
+Make safe filenames.
+
+Input:
+Plain TextDocument/Test:Version|1Show more lines
+
+This line:
+Pythonre.sub(r'[\\/:*?"<>|]', "_", name)Show more lines
+replaces bad characters.
+Output:
+Plain TextDocument_Test_Version_1Show more lines
+
+6. read_doc_rows()
+This function reads CSV.
+
+CSV Example
+CSVid,name__v,major_version_number__v10,Protocol,110,Protocol,110,Protocol,2Show more lines
+
+DictReader
+Pythonreader = csv.DictReader(f)Show more lines
+Each row becomes:
+Python{ "id":"10", "name__v":"Protocol", "major_version_number__v":"1"}Show more lines
+
+Check Columns
+Pythonmissing = [...]Show more lines
+Ensures CSV contains required columns.
+
+Deduplicate
+Pythonseen={}Show more lines
+Tracks unique:
+Python(doc_id, major)Show more lines
+Example:
+Python(10,1)Show more lines
+If duplicate appears later:
+Ignored.
+
+Returns:
+Python[ {   "id":"10",   "major":"1",   "name":"Protocol" }]Show more lines
+
+7. download_version_rendition()
+This is the heart of the script.
+
+Build URL
+Pythonhttps://vault/api/v26.1/objects/documents/123/versions/1/0/renditions/viewable_rendition__vShow more lines
+Meaning:
+Plain TextDocument = 123Version = 1.0Rendition = Viewable PDFShow more lines
+
+GET Request
+Pythonsession.get(...)Show more lines
+Downloads file.
+
+Content-Type Check
+Pythoncontent_type = resp.headers.get(...)Show more lines
+Success:
+Plain Textapplication/octet-streamShow more lines
+Failure:
+Plain Textapplication/jsonShow more lines
+
+Vault errors return JSON:
+JSON{ "responseStatus":"FAILURE"}Show more lines
+Script handles that.
+
+Extract extension
+PythonContent-DispositionShow more lines
+Example:
+Plain Textfilename=test.pdfShow more lines
+Extracts:
+Plain TextpdfShow more lines
+
+Create folder
+Pythondoc_folder.mkdir(...)Show more lines
+Example:
+Plain Textrenditions/   123/Show more lines
+
+Save File
+Pythonwith open(out_path,"wb")Show more lines
+Binary mode.
+Chunks:
+Pythonresp.iter_content(...)Show more lines
+Downloads large files safely.
+
+Returns:
+Python{ "status":"SUCCESS"}Show more lines
+or
+Python{ "status":"FAILED"}Show more lines
+
+8. main()
+Entry point.
+
+Loads .env
+Pythonload_env_file()Show more lines
+
+Creates parser
+Pythonparser = argparse.ArgumentParser()Show more lines
+Allows:
+Shellpython script.py \ --vault-dns abc.com \ --csv docs.csvShow more lines
+
+Command Line Arguments
+Example:
+Python--vault-dns--username--csv--rendition-typeShow more lines
+These are inputs to script.
+
+Example execution:
+Shellpython download.py \ --vault-dns company.veevavault.com \ --username test@company.com \ --csv docs.csv \ --rendition-type viewable_rendition__vShow more lines
+
+Validation
+Pythonif missing:Show more lines
+Ensures required inputs exist.
+
+Password
+Pythonpassword = getpass.getpass()Show more lines
+Prompts securely.
+
+Authentication
+Pythonsession_id = authenticate(...)Show more lines
+Gets Vault session.
+
+Create Session
+Pythonsession = requests.Session()Show more lines
+Session stores:
+PythonAuthorization=session_idShow more lines
+once.
+No need to send repeatedly.
+
+Read CSV
+Pythondoc_rows = read_doc_rows(...)Show more lines
+Gets document list.
+
+Loop Through Documents
+Pythonfor row in doc_rows:Show more lines
+Example:
+Python10111213Show more lines
+Downloaded one-by-one.
+
+Error Handling
+Pythontry:Show more lines
+If one document fails:
+Plain TextContinue next documentShow more lines
+instead of stopping entire script.
+Very good practice.
+
+Logging
+Creates:
+Plain Textresults_log.csvShow more lines
+Example:
+CSVdoc_id,version,status10,1.0,SUCCESS11,1.0,FAILEDShow more lines
+
+Summary
+Pythonsuccess_countfail_countShow more lines
+Output:
+Plain TextDone.150 succeeded3 failedShow more lines
+
+Python Concepts Used Here
+This single script teaches:
+Basics
+✅ Variables
+✅ Loops
+✅ Conditions
+✅ Functions
+✅ Dictionaries
+✅ Lists
+
+Intermediate
+✅ File handling
+✅ CSV processing
+✅ API calls
+✅ JSON handling
+✅ Error handling
+✅ Environment variables
+✅ Regex
+✅ Pathlib
+
+Advanced
+✅ Sessions
+✅ Streaming downloads
+✅ Command-line arguments
+✅ Modular programming
+✅ Response validation
+✅ Logging
+
+Learning Roadmap For Veeva Vault API Automation
+Phase 1: Python Fundamentals (2 Weeks)
+Learn:
+PythonvariablesliststuplesdictsloopsfunctionsShow more lines
+Practice:
+PythonforifdefShow more lines
+
+Phase 2: Files & CSV (1 Week)
+Learn:
+Pythonopen()csvpathlibShow more lines
+Practice:
+PythonRead CSVWrite CSVCreate foldersShow more lines
+
+Phase 3: API Fundamentals (2 Weeks)
+Learn:
+Pythonrequests.get()requests.post()requests.put()requests.delete()Show more lines
+Understand:
+Plain TextStatus Code200201400401403404500Show more lines
+Understand JSON deeply.
+
+Phase 4: Veeva Vault APIs (2–4 Weeks)
+Master:
+Authentication
+HTTPPOST /authShow more lines
+Documents
+HTTPGET /objects/documentsShow more lines
+Renditions
+HTTPGET /renditionsShow more lines
+Metadata
+HTTPGET /objects/documents/{id}Show more lines
+Search
+HTTPPOST /queryShow more lines
+
+Phase 5: Automation Projects
+Build:
+Project 1
+Document Downloader
+(very similar to this script)
+
+Project 2
+Bulk Document Metadata Export
+
+Project 3
+Bulk User Extraction
+
+Project 4
+Document Migration Validation
+
+Project 5
+Report Comparison Automation
+
+Final Advice
+For a Veeva Vault API automation career, focus heavily on these Python topics:
+
+requests (most important)
+JSON
+CSV
+Functions
+Exception Handling (try/except)
+Pathlib
+Authentication & Sessions
+Veeva Vault REST APIs
+
+This script is already at about an intermediate Python automation level. If you fully understand every line in it, you'll already be ahead of many Vault administrators and on your way toward becoming a Vault API automation specialist.
